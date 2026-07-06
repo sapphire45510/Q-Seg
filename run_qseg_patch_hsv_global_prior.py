@@ -1,0 +1,605 @@
+import os
+import time
+import argparse
+from datetime import datetime
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+import dimod
+import neal
+from PIL import Image, ImageFilter
+from matplotlib.colors import rgb_to_hsv
+
+try:
+    from qseg.utils import decode_binary_string
+except Exception:
+    def decode_binary_string(binary_string, height, width):
+        return np.asarray(binary_string, dtype=int).reshape((height, width))
+
+
+def hsv_distance2(a, b, h_weight=2.0, s_weight=1.0, v_weight=0.5):
+    dh = abs(a[0] - b[0])
+    dh = min(dh, 1.0 - dh)
+    ds = a[1] - b[1]
+    dv = a[2] - b[2]
+    return h_weight * dh * dh + s_weight * ds * ds + v_weight * dv * dv
+
+
+def gaussian_dissimilarity_hsv(a, b, sigma=0.25):
+    d2 = hsv_distance2(a, b)
+    return 1.0 - np.exp(-d2 / (2.0 * sigma * sigma))
+
+
+def load_full_image_hsv(image_path, target_size=None, median_size=5):
+    img = Image.open(image_path).convert("RGB")
+
+    if median_size and median_size > 1:
+        img = img.filter(ImageFilter.MedianFilter(size=median_size))
+
+    if target_size is not None:
+        img = img.resize((target_size, target_size), resample=Image.Resampling.BOX)
+
+    rgb = np.array(img).astype(float) / 255.0
+    hsv = rgb_to_hsv(rgb)
+    return rgb, hsv
+
+
+def image_to_grid_graph_hsv(hsv_img, sigma=0.25):
+    h, w, _ = hsv_img.shape
+    raw_edges = []
+    min_weight = float("inf")
+    max_weight = float("-inf")
+
+    for y in range(h):
+        for x in range(w):
+            i = y * w + x
+
+            if y > 0:
+                j = (y - 1) * w + x
+                weight = gaussian_dissimilarity_hsv(hsv_img[y, x], hsv_img[y - 1, x], sigma=sigma)
+                raw_edges.append((i, j, weight))
+                min_weight = min(min_weight, weight)
+                max_weight = max(max_weight, weight)
+
+            if x > 0:
+                j = y * w + (x - 1)
+                weight = gaussian_dissimilarity_hsv(hsv_img[y, x], hsv_img[y, x - 1], sigma=sigma)
+                raw_edges.append((i, j, weight))
+                min_weight = min(min_weight, weight)
+                max_weight = max(max_weight, weight)
+
+    normalized_edges = []
+    a, b = -1, 1
+
+    for i, j, weight in raw_edges:
+        if max_weight - min_weight > 1e-12:
+            normalized = ((b - a) * ((weight - min_weight) / (max_weight - min_weight))) + a
+            normalized = -1.0 * np.round(normalized, 4)
+        elif max_weight == 0 and min_weight == 0:
+            normalized = 1.0
+        else:
+            normalized = -1.0 * np.round(weight, 4)
+
+        normalized_edges.append((i, j, float(normalized)))
+
+    return normalized_edges
+
+
+def normalize01(x):
+    x = np.asarray(x, dtype=np.float32)
+    mn = float(np.min(x))
+    mx = float(np.max(x))
+    if mx - mn < 1e-12:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x - mn) / (mx - mn)
+
+
+def circular_hue_distance(H, center):
+    d = np.abs(H - center)
+    return np.minimum(d, 1.0 - d)
+
+
+def build_global_prior(hsv, target_ratio=0.3, prior_class="soil"):
+    """
+    Build a full-image binary prior.
+
+    target_ratio is applied once on the full image, not inside each patch.
+
+    prior_class="soil":
+        prior=1 means soil / bare ground / road-like pixels.
+    prior_class="vegetation":
+        prior=1 means vegetation-like pixels.
+
+    Later, QUBO variable x_i=1 is encouraged where prior_i=1.
+    """
+    H = hsv[:, :, 0]
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    # Matplotlib HSV hue convention:
+    # red = 0, yellow ~= 1/6, green ~= 1/3.
+    green_dist = circular_hue_distance(H, 1.0 / 3.0)
+    soil_dist = circular_hue_distance(H, 0.10)  # brown/orange/yellow soil often lies near this range
+
+    vegetation_score = -green_dist + 0.55 * S + 0.15 * V
+
+    # Soil score is intentionally broad: close to brown/orange, not too green, and not too dark.
+    soil_score = -soil_dist + 0.35 * S + 0.20 * V + 0.35 * green_dist
+
+    if prior_class == "soil":
+        score = soil_score
+    elif prior_class == "vegetation":
+        score = vegetation_score
+    else:
+        raise ValueError("prior_class must be 'soil' or 'vegetation'")
+
+    threshold = np.quantile(score, 1.0 - target_ratio)
+    prior = (score >= threshold).astype(np.float32)
+
+    debug_scores = {
+        "selected_score": score.astype(np.float32),
+        "vegetation_score": vegetation_score.astype(np.float32),
+        "soil_score": soil_score.astype(np.float32),
+        "threshold": float(threshold),
+    }
+    return prior, debug_scores
+
+
+def get_linear_quadratic_dict(W):
+    n = W.shape[0]
+    linear = {}
+    quadratic = {}
+
+    for i in range(n):
+        linear[i] = float(np.sum(W[i]))
+        for j in range(i + 1, n):
+            if W[i, j] != 0:
+                quadratic[(i, j)] = float(-W[i, j])
+
+    return linear, quadratic
+
+
+def add_unary_prior(linear, prior_patch, unary_weight=1.0):
+    """
+    prior_patch = 1 means soil
+    x_i = 1 means soil
+
+    If prior=1:
+        encourage x=1 -> add negative linear coefficient
+
+    If prior=0:
+        encourage x=0 -> add positive linear coefficient
+    """
+    flat_prior = prior_patch.reshape(-1)
+
+    for i, p in enumerate(flat_prior):
+        if p == 1:
+            linear[i] = linear.get(i, 0.0) - unary_weight
+        else:
+            linear[i] = linear.get(i, 0.0) + unary_weight
+
+    return linear
+
+
+def simulated_annealer_solver(G, prior_patch=None, n_samples=2000, unary_weight=1.0):
+    start_time = time.time()
+
+    W = nx.adjacency_matrix(G).todense()
+    linear, quadratic = get_linear_quadratic_dict(W)
+    n = W.shape[0]
+
+    if prior_patch is not None:
+        linear = add_unary_prior(linear, prior_patch, unary_weight=unary_weight)
+
+    bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
+    problem_formulation_time = time.time() - start_time
+
+    start_time = time.time()
+    sampler = neal.SimulatedAnnealingSampler()
+    sample_set = sampler.sample(bqm, num_reads=n_samples)
+    response_time = time.time() - start_time
+
+    samples_df = sample_set.to_pandas_dataframe()
+    info_dict = {
+        "problem_formulation_time": problem_formulation_time,
+        "response_time": response_time,
+        "num_variables": n,
+        "num_quadratic_terms": len(quadratic),
+        "unary_weight": unary_weight,
+    }
+    return samples_df, info_dict
+
+
+def solve_one_patch_hsv(hsv_patch, prior_patch=None, n_samples=2000, unary_weight=1.0, sigma=0.25):
+    patch_h, patch_w = hsv_patch.shape[:2]
+    edge_list = image_to_grid_graph_hsv(hsv_patch, sigma=sigma)
+
+    G = nx.Graph()
+    G.add_nodes_from(range(patch_h * patch_w))
+    G.add_weighted_edges_from(edge_list)
+
+    samples_df, info = simulated_annealer_solver(
+        G,
+        prior_patch=prior_patch,
+        n_samples=n_samples,
+        unary_weight=unary_weight,
+    )
+
+    best_sample = samples_df.sort_values("energy").iloc[0]
+    solution_binary_string = best_sample.drop(
+        labels=["energy", "num_occurrences", "chain_break_fraction"],
+        errors="ignore",
+    ).astype(int).to_numpy()
+
+    mask = decode_binary_string(solution_binary_string, patch_h, patch_w)
+    return mask.astype(np.float32), info, float(best_sample["energy"])
+
+
+def get_patch_starts(length, patch_size, stride):
+    if length <= patch_size:
+        return [0]
+
+    starts = list(range(0, length - patch_size + 1, stride))
+    last = length - patch_size
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def cosine_weight_2d(h, w, eps=1e-3):
+    wy = np.hanning(h) if h > 1 else np.ones(1)
+    wx = np.hanning(w) if w > 1 else np.ones(1)
+    weight = np.outer(wy, wx)
+    weight = np.maximum(weight, eps)
+    return weight.astype(np.float32)
+
+
+def align_patch_label_with_overlap(patch_mask, vote_sum, weight_sum, y0, y1, x0, x1):
+    """
+    Optional safety alignment for overlapping patches.
+
+    With global prior, labels should already have global meaning.
+    This step is kept as a tie-breaker: if flipping makes a patch more consistent
+    with previously reconstructed overlap, flip it.
+    """
+    existing_weight = weight_sum[y0:y1, x0:x1]
+    overlap = existing_weight > 1e-12
+
+    if not np.any(overlap):
+        return patch_mask, False
+
+    existing_score = vote_sum[y0:y1, x0:x1] / np.maximum(existing_weight, 1e-12)
+    existing_mask = (existing_score >= 0.5).astype(np.float32)
+
+    diff_original = np.mean(np.abs(patch_mask[overlap] - existing_mask[overlap]))
+    diff_flipped = np.mean(np.abs((1.0 - patch_mask[overlap]) - existing_mask[overlap]))
+
+    if diff_flipped < diff_original:
+        return 1.0 - patch_mask, True
+    return patch_mask, False
+
+
+def patch_qseg_reconstruct_hsv(
+    hsv,
+    global_prior,
+    patch_size=32,
+    stride=16,
+    n_samples=2000,
+    unary_weight=1.0,
+    sigma=0.25,
+    use_center_weight=True,
+    use_label_alignment=False,
+):
+    H, W = hsv.shape[:2]
+    vote_sum = np.zeros((H, W), dtype=np.float32)
+    weight_sum = np.zeros((H, W), dtype=np.float32)
+
+    y_starts = get_patch_starts(H, patch_size, stride)
+    x_starts = get_patch_starts(W, patch_size, stride)
+
+    patch_infos = []
+    total_patches = len(y_starts) * len(x_starts)
+    patch_id = 0
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            patch_id += 1
+            y1 = min(y0 + patch_size, H)
+            x1 = min(x0 + patch_size, W)
+
+            hsv_patch = hsv[y0:y1, x0:x1]
+            prior_patch = global_prior[y0:y1, x0:x1]
+
+            print(f"Solving patch {patch_id}/{total_patches}: y={y0}:{y1}, x={x0}:{x1}")
+
+            patch_mask, info, energy = solve_one_patch_hsv(
+                hsv_patch,
+                prior_patch=prior_patch,
+                n_samples=n_samples,
+                unary_weight=unary_weight,
+                sigma=sigma,
+            )
+
+            flipped = False
+            if use_label_alignment:
+                patch_mask, flipped = align_patch_label_with_overlap(
+                    patch_mask,
+                    vote_sum,
+                    weight_sum,
+                    y0,
+                    y1,
+                    x0,
+                    x1,
+                )
+
+            ph, pw = patch_mask.shape
+            if use_center_weight:
+                weight = cosine_weight_2d(ph, pw)
+            else:
+                weight = np.ones((ph, pw), dtype=np.float32)
+
+            vote_sum[y0:y1, x0:x1] += patch_mask * weight
+            weight_sum[y0:y1, x0:x1] += weight
+
+            patch_infos.append({
+                "patch_id": patch_id,
+                "y0": y0,
+                "y1": y1,
+                "x0": x0,
+                "x1": x1,
+                "energy": energy,
+                "flipped": flipped,
+                "prior_ratio_in_patch": float(np.mean(prior_patch)),
+                **info,
+            })
+
+    score_map = vote_sum / np.maximum(weight_sum, 1e-12)
+    final_mask = (score_map >= 0.5).astype(np.uint8)
+    return final_mask, score_map, patch_infos
+
+
+def make_boundary_overlay(rgb, mask):
+    h, w = mask.shape
+    overlay = rgb.copy()
+    boundary = np.zeros_like(mask, dtype=bool)
+
+    for y in range(h):
+        for x in range(w):
+            if y + 1 < h and mask[y, x] != mask[y + 1, x]:
+                boundary[y, x] = True
+                boundary[y + 1, x] = True
+            if x + 1 < w and mask[y, x] != mask[y, x + 1]:
+                boundary[y, x] = True
+                boundary[y, x + 1] = True
+
+    overlay[boundary] = [1.0, 0.0, 0.0]
+    return overlay
+
+
+def save_image(array, path, title=None, cmap=None, vmin=None, vmax=None, colorbar=False):
+    plt.figure()
+    plt.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax)
+    if title:
+        plt.title(title)
+    plt.axis("off")
+    if colorbar:
+        plt.colorbar()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def save_result_images(rgb, final_mask, score_map, global_prior, debug_scores, output_dir, prior_class):
+    os.makedirs(output_dir, exist_ok=True)
+
+    save_image(
+        rgb,
+        os.path.join(output_dir, "input_full_resolution.png"),
+        title="Input image: median blur + HSV, no 32x32 global resize",
+    )
+
+    save_image(
+        global_prior,
+        os.path.join(output_dir, f"global_{prior_class}_prior.png"),
+        title=f"Global {prior_class} prior",
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+
+    save_image(
+        normalize01(debug_scores["selected_score"]),
+        os.path.join(output_dir, f"global_{prior_class}_score.png"),
+        title=f"Global {prior_class} score",
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+
+    save_image(
+        score_map,
+        os.path.join(output_dir, "patch_voting_score_map.png"),
+        title="Patch voting score map",
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+
+    save_image(
+        final_mask,
+        os.path.join(output_dir, "patch_qseg_mask.png"),
+        title=f"Patch-based Q-Seg mask: x=1 means {prior_class}",
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+
+    overlay = make_boundary_overlay(rgb, final_mask)
+    save_image(
+        overlay,
+        os.path.join(output_dir, "patch_qseg_boundary_overlay.png"),
+        title="Boundary overlay: patch-based Q-Seg with global prior",
+    )
+
+
+def save_config(args, output_dir, elapsed_time, image_shape, total_patches, debug_scores):
+    config_path = os.path.join(output_dir, "config.txt")
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("Patch-based Q-Seg with Global Prior Configuration\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Time                : {datetime.now()}\n")
+        f.write(f"Image               : {args.image_path}\n")
+        f.write(f"Image shape         : {image_shape}\n")
+        f.write(f"Target size         : {args.target_size}\n")
+        f.write(f"Median size         : {args.median_size}\n")
+        f.write(f"Patch size          : {args.patch_size}\n")
+        f.write(f"Stride              : {args.stride}\n")
+        f.write(f"Overlap             : {args.patch_size - args.stride}\n")
+        f.write(f"Prior class         : {args.prior_class}\n")
+        f.write(f"Target ratio        : {args.target_ratio}\n")
+        f.write(f"Global threshold    : {debug_scores['threshold']}\n")
+        f.write(f"Unary weight        : {args.unary_weight}\n")
+        f.write(f"Sigma               : {args.sigma}\n")
+        f.write(f"n_samples           : {args.n_samples}\n")
+        f.write(f"Sampler             : SimulatedAnnealingSampler\n")
+        f.write(f"Center weighting    : {not args.no_center_weight}\n")
+        f.write(f"Label alignment     : {args.use_label_alignment}\n")
+        f.write(f"Total patches       : {total_patches}\n")
+        f.write(f"Execution time (s)  : {elapsed_time:.2f}\n")
+        f.write("\nNote:\n")
+        f.write("  target_ratio is applied once to the whole image to build the global prior.\n")
+        f.write("  It is not used as a per-patch balance penalty.\n")
+        f.write(f"  In the final mask, label 1 means {args.prior_class}.\n")
+
+
+def save_patch_infos_csv(patch_infos, output_dir):
+    info_path = os.path.join(output_dir, "patch_infos.csv")
+    if not patch_infos:
+        return
+    keys = list(patch_infos[0].keys())
+    with open(info_path, "w", encoding="utf-8") as f:
+        f.write(",".join(keys) + "\n")
+        for row in patch_infos:
+            f.write(",".join(str(row.get(k, "")) for k in keys) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Patch-based HSV Q-Seg using a full-image prior instead of per-patch balance penalty."
+    )
+    parser.add_argument("--image_path", type=str, default="71619_sat_30.jpg")
+    parser.add_argument(
+        "--target_size",
+        type=int,
+        default=256,
+        help="Resize full image to target_size x target_size before patching. Use 0 to keep original size.",
+    )
+    parser.add_argument("--patch_size", type=int, default=64)
+    parser.add_argument("--stride", type=int, default=32)
+    parser.add_argument("--median_size", type=int, default=5)
+    parser.add_argument("--sigma", type=float, default=0.25)
+    parser.add_argument("--n_samples", type=int, default=200)
+    parser.add_argument(
+        "--target_ratio",
+        type=float,
+        default=0.3,
+        help="Full-image prior ratio. For prior_class=soil, 0.3 means top 30 percent soil-like pixels.",
+    )
+    parser.add_argument(
+        "--prior_class",
+        type=str,
+        default="soil",
+        choices=["soil", "vegetation"],
+        help="Class represented by binary label 1 in the final mask.",
+    )
+    parser.add_argument("--unary_weight", type=float, default=1.0)
+    parser.add_argument("--no_center_weight", action="store_true")
+    parser.add_argument(
+        "--use_label_alignment",
+        action="store_true",
+        help="Optional overlap-based 0/1 flipping. Usually not needed when global prior is used.",
+    )
+    parser.add_argument("--output_dir", type=str, default="patch_qseg_global_prior_results")
+    args = parser.parse_args()
+
+    if not (0.0 < args.target_ratio < 1.0):
+        raise ValueError("--target_ratio must be between 0 and 1.")
+    if args.stride <= 0:
+        raise ValueError("--stride must be positive.")
+    if args.patch_size <= 0:
+        raise ValueError("--patch_size must be positive.")
+
+    target_size = None if args.target_size == 0 else args.target_size
+    start_total = time.time()
+
+    rgb, hsv = load_full_image_hsv(
+        args.image_path,
+        target_size=target_size,
+        median_size=args.median_size,
+    )
+
+    global_prior, debug_scores = build_global_prior(
+        hsv,
+        target_ratio=args.target_ratio,
+        prior_class=args.prior_class,
+    )
+
+    print("Image shape:", rgb.shape)
+    print("Patch size:", args.patch_size)
+    print("Stride:", args.stride)
+    print("Prior class:", args.prior_class)
+    print("Full-image target ratio:", args.target_ratio)
+    print("Actual prior ratio:", float(np.mean(global_prior)))
+    print("Unary weight:", args.unary_weight)
+
+    final_mask, score_map, patch_infos = patch_qseg_reconstruct_hsv(
+        hsv,
+        global_prior,
+        patch_size=args.patch_size,
+        stride=args.stride,
+        n_samples=args.n_samples,
+        unary_weight=args.unary_weight,
+        sigma=args.sigma,
+        use_center_weight=not args.no_center_weight,
+        use_label_alignment=args.use_label_alignment,
+    )
+
+    total_time = time.time() - start_total
+
+    print("\nUnique final mask values:")
+    print(np.unique(final_mask, return_counts=True))
+    print("Final label-1 ratio:", float(np.mean(final_mask)))
+    print("\nTotal patches:", len(patch_infos))
+    print("Total time:", total_time)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    np.save(os.path.join(args.output_dir, "patch_qseg_mask.npy"), final_mask)
+    np.save(os.path.join(args.output_dir, "patch_voting_score_map.npy"), score_map)
+    np.save(os.path.join(args.output_dir, f"global_{args.prior_class}_prior.npy"), global_prior)
+    np.save(os.path.join(args.output_dir, f"global_{args.prior_class}_score.npy"), debug_scores["selected_score"])
+
+    save_patch_infos_csv(patch_infos, args.output_dir)
+    save_result_images(rgb, final_mask, score_map, global_prior, debug_scores, args.output_dir, args.prior_class)
+    save_config(args, args.output_dir, total_time, rgb.shape, len(patch_infos), debug_scores)
+
+    print("\nSaved results to:", args.output_dir)
+    print("- input_full_resolution.png")
+    print(f"- global_{args.prior_class}_prior.png")
+    print(f"- global_{args.prior_class}_score.png")
+    print("- patch_voting_score_map.png")
+    print("- patch_qseg_mask.png")
+    print("- patch_qseg_boundary_overlay.png")
+    print("- patch_qseg_mask.npy")
+    print("- patch_voting_score_map.npy")
+    print(f"- global_{args.prior_class}_prior.npy")
+    print(f"- global_{args.prior_class}_score.npy")
+    print("- patch_infos.csv")
+    print("- config.txt")
+
+
+if __name__ == "__main__":
+    main()
