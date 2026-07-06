@@ -209,7 +209,7 @@ def make_boundary_overlay(rgb, mask):
 
 
 def main():
-    image_path = "71619_sat_26.jpg"
+    image_path = "71619_sat_30.jpg"
     resize_size = 32
 
     rgb, hsv = load_and_preprocess_image_hsv(
@@ -224,7 +224,7 @@ def main():
     plt.imshow(rgb)
     plt.title("Input image: median blur + HSV + resize 32x32")
     plt.axis("off")
-    plt.savefig("input_hsv_resized_32x32_2.png", dpi=300, bbox_inches="tight")
+    plt.savefig("input_hsv_resized_32x32_4.png", dpi=300, bbox_inches="tight")
     plt.show()
 
     normalized_nx_elist = image_to_grid_graph_hsv(
@@ -236,12 +236,16 @@ def main():
     G.add_nodes_from(range(height * width))
     G.add_weighted_edges_from(normalized_nx_elist)
 
+    v = hsv[:, :, 2]
+    target_ratio = np.mean(v < np.mean(v))
+    print(target_ratio)
+
     start_time = time.time()
 
     samples_dataframe, info_dict = simulated_annealer_solver(
         G,
         n_samples=2000,
-        target_ratio=0.3,
+        target_ratio=target_ratio,
         balance_penalty=0.01
     )
 
@@ -279,8 +283,8 @@ def main():
     plt.imshow(segmentation_mask, cmap="gray", vmin=0, vmax=1)
     plt.title("Segmentation mask: HSV + SA + balance penalty")
     plt.axis("off")
-    plt.colorbar()
-    plt.savefig("segmentation_mask_hsv_balance_2.png", dpi=300, bbox_inches="tight")
+    #plt.colorbar()
+    plt.savefig("segmentation_mask_hsv_balance_4.png", dpi=300, bbox_inches="tight")
     plt.show()
 
     overlay = make_boundary_overlay(rgb, segmentation_mask)
@@ -289,7 +293,7 @@ def main():
     plt.imshow(overlay)
     plt.title("Boundary overlay: HSV + SA + balance penalty")
     plt.axis("off")
-    plt.savefig("boundary_overlay_hsv_balance_2.png", dpi=300, bbox_inches="tight")
+    plt.savefig("boundary_overlay_hsv_balance_4.png", dpi=300, bbox_inches="tight")
     plt.show()
 
     cut_edges = [
