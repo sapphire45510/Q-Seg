@@ -9,4 +9,10 @@ venv
 71619_sat_44/
 72807_sat_88/
 result/
-result(有3對比/
+result(3_compare/
+*.json
+71619_sat_26_json/
+71619_sat_30_json/
+71619_sat_44_json/
+72807_sat_88_json/
+vegetation_results/
