@@ -125,6 +125,7 @@ rfc3986-validator==0.1.1
 rpds-py==0.25.1
 rustworkx==0.16.0
 scipy==1.15.3
+scikit-image==0.25.2
 Send2Trash==1.8.3
 setuptools==80.9.0
 six==1.17.0
